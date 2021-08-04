@@ -1,0 +1,963 @@
+# -*- coding: Shift-JIS -*-
+
+import io
+import os
+import pickle
+import subprocess, os
+
+import numpy as np
+import pandas as pd
+# from sklearn.ensemble import RandomForestRegressor
+from tqdm.auto import tqdm
+# import xgboost as xgb
+import lightgbm as lgb
+from sklearn.preprocessing import LabelEncoder
+# import json
+
+from scipy.stats import spearmanr
+
+
+class ScoringService(object):
+    # ŒP—ûŠúŠÔI—¹“ú
+    TRAIN_END = "2018-12-31"
+    # •]‰¿ŠúŠÔŠJn“ú
+    VAL_START = "2019-02-01"
+    # •]‰¿ŠúŠÔI—¹“ú
+    VAL_END = "2019-12-01"
+    # ƒeƒXƒgŠúŠÔŠJn“ú
+    TEST_START = "2020-01-01"
+    # –Ú“I•Ï”
+    TARGET_LABELS = ['label_high_20', 'label_low_20']
+
+    # ƒf[ƒ^‚ğ‚±‚Ì•Ï”‚É“Ç‚İ‚Ş
+    dfs = None
+    # ƒ‚ƒfƒ‹‚ğ‚±‚Ì•Ï”‚É“Ç‚İ‚Ş
+    models = None
+    # ‘ÎÛ‚Ì–Á•¿ƒR[ƒh‚ğ‚±‚Ì•Ï”‚É“Ç‚İ‚Ş
+    codes = None
+
+    models_fname = None
+
+    # for Stacker model
+    class_model = {'label_high_20':{},
+                   'label_low_20':{}
+                   }
+
+
+    @classmethod
+    def get_inputs(cls, dataset_dir):
+        """
+        Args:
+            dataset_dir (str)  : path to dataset directory
+        Returns:
+            dict[str]: path to dataset files
+        """
+        inputs = {
+            "stock_list": f"{dataset_dir}/stock_list.csv.gz",
+            "stock_price": f"{dataset_dir}/stock_price.csv.gz",
+            "stock_fin": f"{dataset_dir}/stock_fin.csv.gz",
+            # "stock_fin_price": f"{dataset_dir}/stock_fin_price.csv.gz",
+            "stock_labels": f"{dataset_dir}/stock_labels.csv.gz",
+        }
+        return inputs
+
+    @classmethod
+    def get_dataset(cls, inputs):
+        """
+        Args:
+            inputs (list[str]): path to dataset files
+        Returns:
+            dict[pd.DataFrame]: loaded data
+        """
+        if cls.dfs is None:
+            cls.dfs = {}
+        for k, v in inputs.items():
+            cls.dfs[k] = pd.read_csv(v)
+            # DataFrame‚Ìindex‚ğİ’è‚µ‚Ü‚·B
+            if k == "stock_price":
+                cls.dfs[k].loc[:, "datetime"] = pd.to_datetime(
+                    cls.dfs[k].loc[:, "EndOfDayQuote Date"]
+                )
+                cls.dfs[k].set_index("datetime", inplace=True)
+            elif k in ["stock_fin", "stock_fin_price", "stock_labels"]:
+                cls.dfs[k].loc[:, "datetime"] = pd.to_datetime(
+                    cls.dfs[k].loc[:, "base_date"]
+                )
+                cls.dfs[k].set_index("datetime", inplace=True)
+        return cls.dfs
+
+    @classmethod
+    def get_codes(cls, dfs):
+        """
+        Args:
+            dfs (dict[pd.DataFrame]): loaded data
+        Returns:
+            array: list of stock codes
+        """
+        stock_list = dfs["stock_list"].copy()
+        # —\‘ª‘ÎÛ‚Ì–Á•¿ƒR[ƒh‚ğæ“¾
+        cls.codes = stock_list[stock_list["prediction_target"] == True][
+            "Local Code"
+        ].values
+        return cls.codes
+
+    @classmethod
+    def get_rsi (cls, data, time_window):
+        diff = data.diff(1).dropna()        # diff in one field(one day)
+
+        #this preservers dimensions off diff values
+        up_chg = 0 * diff
+        down_chg = 0 * diff
+
+        # up change is equal to the positive difference, otherwise equal to zero
+        up_chg[diff > 0] = diff[ diff>0 ]
+
+        # down change is equal to negative deifference, otherwise equal to zero
+        down_chg[diff < 0] = diff[ diff < 0 ]
+
+        # check pandas documentation for ewm
+        # https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.ewm.html
+        # values are related to exponential decay
+        # we set com=time_window-1 so we get decay alpha=1/time_window
+        up_chg_avg   = up_chg.ewm(com=time_window-1 , min_periods=time_window).mean()
+        down_chg_avg = down_chg.ewm(com=time_window-1 , min_periods=time_window).mean()
+
+        rs = abs(up_chg_avg/down_chg_avg)
+        rsi = 100 - 100/(1+rs)
+        return rsi
+
+    @classmethod
+    def get_macd(cls, close, fast=12, slow=26, signal=9):
+        emaslow = close.ewm( span=slow, min_periods=1).mean()
+        emafast = close.ewm( span=fast, min_periods=1).mean()
+
+        macd = emafast - emaslow
+        macdsignal = macd.ewm( span=9, min_periods=1).mean()
+        macdhist = (macd - macdsignal)
+
+        return macd, macdsignal, macdhist
+
+    @classmethod
+    def get_features_for_predict(cls, dfs, codes, start_dt="2016-01-01"):
+        """
+        Args:
+            dfs (dict)  : dict of pd.DataFrame include stock_fin, stock_price
+            code (int)  : A local code for a listed company
+            start_dt (str): specify date range
+        Returns:
+            feature DataFrame (pd.DataFrame)
+        """
+        # get all Stock List Featuress
+        stock_list_df = dfs['stock_list'].copy()
+        stock_list_feats = cls.clean_feature_stock_list(stock_list_df, codes)
+
+        # get All Finance Featuress
+        stock_fin = dfs["stock_fin"].copy()
+        stock_fin_feats = cls.clean_fin_feature(stock_fin, codes)
+
+        # Get All Stock_list + Finance Features
+        stock_fin_index = stock_fin_feats.index
+        stock_fin_feats_new = pd.merge(stock_fin_feats ,stock_list_feats, on="Local Code")
+        stock_fin_feats_new.index = stock_fin_index
+
+        stock_fin_feats_new = stock_fin_feats_new.select_dtypes(include=["float", 'int', 'int64'])
+        stock_fin_feats_new = stock_fin_feats_new.fillna(0)
+
+        # Get All Stock_list + Finance + Price Features
+        feats = pd.DataFrame()
+        price_df = dfs["stock_price"].copy()
+        for code in codes:
+            all_feat = pd.DataFrame()
+            stock_price_feat = cls.clean_feature_price(price_df, code, start_dt)
+            stock_fin_feat = stock_fin_feats_new[stock_fin_feats_new['Local Code'] == code]
+
+            stock_price_feat = stock_price_feat.loc[stock_price_feat.index.isin(stock_fin_feat.index)]
+            stock_fin_feat = stock_fin_feat.loc[stock_fin_feat.index.isin(stock_price_feat.index)]
+
+            all_feat = pd.concat([stock_fin_feat, stock_price_feat], axis=1)#.dropna()
+
+            # Feature V2
+            all_feat['‰¿‘Šz'] = all_feat['EndOfDayQuote ExchangeOfficialClose'] * all_feat['IssuedShareEquityQuote_IssuedShare']
+            all_feat['EPS'] = all_feat['¡Šú“–Šúƒ—˜‰v'] / all_feat['IssuedShareEquityQuote_IssuedShare']
+            all_feat['Š”‚²‚Æƒ‘Y'] = all_feat['ƒ‘Y'] /  all_feat['IssuedShareEquityQuote_IssuedShare']
+            all_feat['Š”‚²‚Æ‘‘Y'] = all_feat['‘‘Y'] /  all_feat['IssuedShareEquityQuote_IssuedShare']
+            all_feat['PBR'] = all_feat['EndOfDayQuote ExchangeOfficialClose']  / all_feat['Š”‚²‚Æƒ‘Y']
+            all_feat['PBR-1'] = all_feat['Š”‚²‚Æƒ‘Y'] / all_feat['EndOfDayQuote ExchangeOfficialClose']
+            all_feat['PER'] = all_feat['‰¿‘Šz']  / all_feat['“–Šúƒ—˜‰v']
+            # Feature V2 over
+
+            all_feat = all_feat.loc[pd.Timestamp(start_dt) :]
+            feats = pd.concat([feats, all_feat])
+
+        # Œ‡‘¹’lˆ—‚ğs‚¢‚Ü‚·B
+        # feats = feats.replace([np.inf, -np.inf], 0)
+        # –Á•¿ƒR[ƒh‚ğİ’è
+    #     feats["code"] = code
+
+        # ¶¬‘ÎÛ“úˆÈ~‚Ì“Á’¥—Ê‚Éi‚é
+    #     feats = feats.loc[pd.Timestamp(start_dt) :]
+
+        return feats
+
+
+    @classmethod
+    def get_model(cls, model_path="../model/", labels=None):
+        """Get model method
+
+        Args:
+            model_path (str): Path to the trained model directory.
+            labels (arrayt): list of prediction target labels
+
+        Returns:
+            bool: The return value. True for success, False otherwise.
+
+        """
+        if cls.models is None:
+            cls.models = {}
+        if cls.models_fname is None:
+            cls.models_fname = {}
+        if labels is None:
+            labels = cls.TARGET_LABELS
+        for label in labels:
+            m = os.path.join(model_path, f"model_{label}.pkl")
+            with open(m, "rb") as f:
+                # pickleŒ`®‚Å•Û‘¶‚³‚ê‚Ä‚¢‚éƒ‚ƒfƒ‹‚ğ“Ç‚İ‚İ
+                model = pickle.load(f)
+                # cols_when_model_builds = model.feature_names
+                cols_when_model_builds = model.feature_name()
+
+                cls.models[label] = model
+                cls.models_fname[label] = cols_when_model_builds
+
+        return True
+
+    @classmethod
+    def clean_feature_stock_list(cls, df_org, codes):
+        df = df_org[df_org['Local Code'].isin(codes)].copy()
+        stock_list_df_use_cols = ['Local Code', 'Section/Products', '33 Sector(Code)', '17 Sector(Code)',
+         'Size Code (New Index Series)', 'Size (New Index Series)', 'IssuedShareEquityQuote AccountingStandard',
+          'IssuedShareEquityQuote IssuedShare']
+
+        enc = LabelEncoder()
+        clean_list = ['Section/Products',
+                     'IssuedShareEquityQuote AccountingStandard',
+                     'Size Code (New Index Series)',
+                     'Size (New Index Series)']
+
+        for cat in clean_list:
+            df[cat] = enc.fit_transform(df[cat]).astype('int')
+
+        df['Size Code (New Index Series)'] = df['Size Code (New Index Series)'].replace(['-'], 0)
+        res_df = df[stock_list_df_use_cols].copy()
+
+        res_df.rename(columns={'33 Sector(Code)': '33_Sector(Code)',
+              '17 Sector(Code)': '17_Sector(Code)',
+              'Size Code (New Index Series)':'Size_Code_(New_Index_Series)',
+              'Size (New Index Series)':'Size_(New_Index_Series)',
+              'IssuedShareEquityQuote AccountingStandard':'IssuedShareEquityQuote_AccountingStandard',
+              'IssuedShareEquityQuote IssuedShare':'IssuedShareEquityQuote_IssuedShare',
+          }, inplace = True)
+
+        return res_df
+
+
+    @classmethod
+    def clean_fin_feature(cls, df_org, codes):
+        fin_columns_trans ={
+        #     'base_date':'“ú•t',
+        # 'Local Code':'–Á•¿ƒR[ƒh',
+        'Result_FinancialStatement AccountingStandard':'‰ïŒvŠî€',
+        'Result_FinancialStatement FiscalPeriodEnd':'ŒˆZŠú',
+        'Result_FinancialStatement ReportType':'ŒˆZí•Ê',
+        'Result_FinancialStatement FiscalYear':'ŒˆZ”N“x',
+        'Result_FinancialStatement ModifyDate':'XV“ú',
+        'Result_FinancialStatement CompanyType':'‰ïĞ‹æ•ª',
+        'Result_FinancialStatement ChangeOfFiscalYearEnd':'ŒˆZŠú•ÏXƒtƒ‰ƒO',
+        'Result_FinancialStatement NetSales':'”„ã‚',
+        'Result_FinancialStatement OperatingIncome':'‰c‹Æ—˜‰v',
+        'Result_FinancialStatement OrdinaryIncome':'Œoí—˜‰v',
+        'Result_FinancialStatement NetIncome':'“–Šúƒ—˜‰v',
+        'Result_FinancialStatement TotalAssets':'‘‘Y',
+        'Result_FinancialStatement NetAssets':'ƒ‘Y',
+        'Result_FinancialStatement CashFlowsFromOperatingActivities':'‰c‹ÆCashFlow',
+        'Result_FinancialStatement CashFlowsFromFinancingActivities':'à–±CashFlow',
+        'Result_FinancialStatement CashFlowsFromInvestingActivities':'“Š‘CashFlow',
+        'Forecast_FinancialStatement AccountingStandard':'‰ïŒvŠî€—\‘z',
+        'Forecast_FinancialStatement FiscalPeriodEnd':'—ˆŠú—\‘zŒˆZŠú',
+        'Forecast_FinancialStatement ReportType':'—ˆŠú—\‘zŒˆZí•Ê',
+        'Forecast_FinancialStatement FiscalYear':'—ˆŠú—\‘zŒˆZ”N“x',
+        'Forecast_FinancialStatement ModifyDate':'—ˆŠú—\‘zXV“ú',
+        'Forecast_FinancialStatement CompanyType':'—ˆŠú—\‘z‰ïĞ‹æ•ª',
+        'Forecast_FinancialStatement ChangeOfFiscalYearEnd':'—ˆŠú—\‘zŒˆZŠú•ÏXFlag',
+        'Forecast_FinancialStatement NetSales':'—ˆŠú—\‘z”„ã‚',
+        'Forecast_FinancialStatement OperatingIncome':'—ˆŠú—\‘z‰c‹Æ—˜‰v',
+        'Forecast_FinancialStatement OrdinaryIncome':'—ˆŠú—\‘zŒoí—˜‰v',
+        'Forecast_FinancialStatement NetIncome':'—ˆŠú—\‘z“–Šúƒ—˜‰v',
+        'Result_Dividend FiscalPeriodEnd':'”z“–ŒˆZŠú',
+        'Result_Dividend ReportType':'”z“–ŒˆZí•Ê',
+        'Result_Dividend FiscalYear':'”z“–ŒˆZ”N“x',
+        'Result_Dividend ModifyDate':'”z“–XV“ú',
+        'Result_Dividend RecordDate':'”z“–Šî€“ú',
+        'Result_Dividend DividendPayableDate':'”z“–x•¥ŠJn“ú',
+        'Result_Dividend QuarterlyDividendPerShare':'ˆêŠ”l”¼Šú”z“–‹à',
+        'Result_Dividend AnnualDividendPerShare':'ˆêŠ””NŠÔ”z“–‹à—İŒv',
+        'Forecast_Dividend FiscalPeriodEnd':'—\‘z”z“–ŒˆZŠú',
+        'Forecast_Dividend ReportType':'—\‘z”z“–ŒˆZí•Ê',
+        'Forecast_Dividend FiscalYear':'—\‘z”z“–ŒˆZ”N“x',
+        'Forecast_Dividend ModifyDate':'—\‘z”z“–XV“ú',
+        'Forecast_Dividend RecordDate':'—\‘z”z“–Šî€“ú',
+        'Forecast_Dividend QuarterlyDividendPerShare':'—\‘zˆêŠ”l”¼Šú”z“–‹à',
+        'Forecast_Dividend AnnualDividendPerShare':'—\‘zˆêŠ””NŠÔ”z“–‹à—İŒv',}
+
+        renew_columns = ['ŒˆZŠú', 'ŒˆZí•Ê','ŒˆZ”N“x','”„ã‚', '‰c‹Æ—˜‰v', 'Œoí—˜‰v' , '“–Šúƒ—˜‰v', '‘‘Y','ƒ‘Y',
+                            '‰c‹ÆCashFlow', 'à–±CashFlow', '“Š‘CashFlow', '¡Šú”„ã‚', '¡Šú‰c‹Æ—˜‰v', '¡ŠúŒoí—˜‰v', '¡Šú“–Šúƒ—˜‰v',
+               '¡Šú”„ã‚L‚Ñ','¡Šú‰c‹Æ—˜‰vL‚Ñ', '¡ŠúŒoí—˜‰vL‚Ñ',  '¡Šú“–Šúƒ—˜‰vL‚Ñ']
+
+
+        def get_fin_quarterly(prev_row, row):
+            if prev_row['ŒˆZ”N“x'] == row['ŒˆZ”N“x'] and prev_row['ŒˆZí•Ê'] == row['ŒˆZí•Ê']:
+                n_s = row['ŒˆZí•Ê']
+                n = int(n_s[-1])
+                return row['”„ã‚']/n ,row['‰c‹Æ—˜‰v']/n ,row['Œoí—˜‰v']/n ,row['“–Šúƒ—˜‰v']/n
+
+            uri = row['”„ã‚'] - prev_row['”„ã‚']
+            eigyo = row['‰c‹Æ—˜‰v'] - prev_row['‰c‹Æ—˜‰v']
+            keijyo = row['Œoí—˜‰v'] - prev_row['Œoí—˜‰v']
+            jyun = row['“–Šúƒ—˜‰v'] - prev_row['“–Šúƒ—˜‰v']
+
+            return uri, eigyo, keijyo,jyun
+
+        def get_fin_quarterly_df(df):
+
+            local_index = 0
+            uri_list = []
+            eigyo_list = []
+            keijyo_list = []
+            jyun_list = []
+
+            for index, row in df.iterrows():
+                uri, eigyo, keijyo,jyun = 0, 0, 0, 0
+                base_row = row
+                if local_index == 0 or row['ŒˆZí•Ê'] == 'Q1':
+                    base_row = row
+                elif row['ŒˆZ”N“x'] == prev_row['ŒˆZ”N“x'] and int(row['ŒˆZí•Ê'][-1]) == int(prev_row['ŒˆZí•Ê'][-1]) + 1:
+                    base_row = prev_row
+                else:
+                    base_row = row
+
+                uri, eigyo, keijyo,jyun = get_fin_quarterly(base_row, row)
+                uri_list.append(uri)
+                eigyo_list.append(eigyo)
+                keijyo_list.append(keijyo)
+                jyun_list.append(jyun)
+
+                prev_row = row
+                local_index +=1
+
+            quarterly_df = pd.DataFrame([uri_list, eigyo_list, keijyo_list, jyun_list])
+            quarterly_df = quarterly_df.T
+            quarterly_df.columns = ['¡Šú”„ã‚', '¡Šú‰c‹Æ—˜‰v', '¡ŠúŒoí—˜‰v', '¡Šú“–Šúƒ—˜‰v']
+            quarterly_df.columns = ['¡Šú”„ã‚', '¡Šú‰c‹Æ—˜‰v', '¡ŠúŒoí—˜‰v', '¡Šú“–Šúƒ—˜‰v']
+            quarterly_df["¡Šú”„ã‚L‚Ñ"] = quarterly_df['¡Šú”„ã‚'].diff() / quarterly_df['¡Šú”„ã‚'].abs().shift()
+            quarterly_df["¡Šú‰c‹Æ—˜‰vL‚Ñ"] = quarterly_df['¡Šú‰c‹Æ—˜‰v'].diff() / quarterly_df['¡Šú‰c‹Æ—˜‰v'].abs().shift()
+            quarterly_df["¡ŠúŒoí—˜‰vL‚Ñ"] = quarterly_df['¡ŠúŒoí—˜‰v'].diff() / quarterly_df['¡ŠúŒoí—˜‰v'].abs().shift()
+            quarterly_df["¡Šú“–Šúƒ—˜‰vL‚Ñ"] = quarterly_df['¡Šú“–Šúƒ—˜‰v'].diff() / quarterly_df['¡Šú“–Šúƒ—˜‰v'].abs().shift()
+            quarterly_df[['¡Šú”„ã‚L‚Ñ', '¡Šú‰c‹Æ—˜‰vL‚Ñ', '¡ŠúŒoí—˜‰vL‚Ñ', '¡Šú“–Šúƒ—˜‰vL‚Ñ']] = quarterly_df[['¡Šú”„ã‚L‚Ñ',
+            '¡Šú‰c‹Æ—˜‰vL‚Ñ', '¡ŠúŒoí—˜‰vL‚Ñ', '¡Šú“–Šúƒ—˜‰vL‚Ñ']].fillna('0')
+            quarterly_df['¡Šú”„ã‚L‚Ñ'] = quarterly_df['¡Šú”„ã‚L‚Ñ'].astype(float)
+            quarterly_df['¡Šú‰c‹Æ—˜‰vL‚Ñ'] = quarterly_df['¡Šú‰c‹Æ—˜‰vL‚Ñ'].astype(float)
+            quarterly_df['¡ŠúŒoí—˜‰vL‚Ñ'] = quarterly_df['¡ŠúŒoí—˜‰vL‚Ñ'].astype(float)
+            quarterly_df['¡Šú“–Šúƒ—˜‰vL‚Ñ'] = quarterly_df['¡Šú“–Šúƒ—˜‰vL‚Ñ'].astype(float)
+
+            quarterly_df.index = df.index
+
+            return quarterly_df
+
+        def find_near_date(new_time, base_time, delta = 60):
+            res = False
+            if new_time < base_time + np.timedelta64(delta,'D') or new_time > base_time - np.timedelta64(delta,'D'):
+                res = True
+            return res
+
+
+
+        def find_near_date(new_time, base_time, delta = 60):
+            res = False
+            if new_time < base_time + np.timedelta64(delta,'D') or new_time > base_time - np.timedelta64(delta,'D'):
+                res = True
+            return res
+
+        def get_yoso_changerate(stock_fin):
+            df = stock_fin.copy()
+            uri_list = []
+            eigyo_list = []
+            keijyo_list = []
+            jyun_list = []
+            local_index = 0
+
+            for index, row in df.iterrows():
+                uri, eigyo, keijyo,jyun = 0, 0, 0, 0
+            #     base_row = row
+                if local_index == 0:
+                    prev_row = row
+
+                if local_index != 0 and row['—ˆŠú—\‘zŒˆZŠú'] is not np.nan and prev_row['—ˆŠú—\‘zŒˆZŠú'] is not np.nan:
+
+
+    #                 if prev_row['—ˆŠú—\‘z”„ã‚'] is not np.nan and row['—ˆŠú—\‘z”„ã‚'] is not np.nan and :
+                    if prev_row['—ˆŠú—\‘z”„ã‚'] != 0:
+                        if row['—ˆŠú—\‘zŒˆZŠú'] == prev_row['—ˆŠú—\‘zŒˆZŠú'] and int(row['—ˆŠú—\‘z”„ã‚']) != int(prev_row['—ˆŠú—\‘z”„ã‚']):
+                            uri = (row['—ˆŠú—\‘z”„ã‚'] - prev_row['—ˆŠú—\‘z”„ã‚']) / np.abs(prev_row['—ˆŠú—\‘z”„ã‚'])
+
+    #                 if prev_row['—ˆŠú—\‘z‰c‹Æ—˜‰v'] is not np.nan and row['—ˆŠú—\‘z‰c‹Æ—˜‰v'] is not np.nan:
+                    if prev_row['—ˆŠú—\‘z‰c‹Æ—˜‰v'] != 0:
+                        if row['—ˆŠú—\‘zŒˆZŠú'] == prev_row['—ˆŠú—\‘zŒˆZŠú'] and int(row['—ˆŠú—\‘z‰c‹Æ—˜‰v']) != int(prev_row['—ˆŠú—\‘z‰c‹Æ—˜‰v']):
+                            eigyo = (row['—ˆŠú—\‘z‰c‹Æ—˜‰v'] - prev_row['—ˆŠú—\‘z‰c‹Æ—˜‰v']) / np.abs(prev_row['—ˆŠú—\‘z‰c‹Æ—˜‰v'])
+
+    #                 if prev_row['—ˆŠú—\‘zŒoí—˜‰v'] is not np.nan and row['—ˆŠú—\‘zŒoí—˜‰v'] is not np.nan :
+                    if prev_row['—ˆŠú—\‘zŒoí—˜‰v'] != 0:
+                        if row['—ˆŠú—\‘zŒˆZŠú'] == prev_row['—ˆŠú—\‘zŒˆZŠú'] and int(row['—ˆŠú—\‘zŒoí—˜‰v']) != int(prev_row['—ˆŠú—\‘zŒoí—˜‰v']):
+                            keijyo = (row['—ˆŠú—\‘zŒoí—˜‰v'] - prev_row['—ˆŠú—\‘zŒoí—˜‰v']) / np.abs(prev_row['—ˆŠú—\‘zŒoí—˜‰v'])
+
+    #                 if prev_row['—ˆŠú—\‘z“–Šúƒ—˜‰v'] is not np.nan and row['—ˆŠú—\‘z“–Šúƒ—˜‰v'] is not np.nan:
+                    if prev_row['—ˆŠú—\‘z“–Šúƒ—˜‰v'] != 0:
+                        if row['—ˆŠú—\‘zŒˆZŠú'] == prev_row['—ˆŠú—\‘zŒˆZŠú'] and int(row['—ˆŠú—\‘z“–Šúƒ—˜‰v']) != int(prev_row['—ˆŠú—\‘z“–Šúƒ—˜‰v']):
+                            jyun = (row['—ˆŠú—\‘z“–Šúƒ—˜‰v'] - prev_row['—ˆŠú—\‘z“–Šúƒ—˜‰v']) / np.abs(prev_row['—ˆŠú—\‘z“–Šúƒ—˜‰v'])
+
+                uri_list.append(uri)
+                eigyo_list.append(eigyo)
+                keijyo_list.append(keijyo)
+                jyun_list.append(jyun)
+
+                prev_row = row
+                local_index += 1
+
+            quarterly_df = pd.DataFrame([uri_list, eigyo_list, keijyo_list, jyun_list])
+            quarterly_df = quarterly_df.T
+            quarterly_df.columns = ['—ˆŠú—\‘z”„ã‚•ÏX—¦', '—ˆŠú—\‘z‰c‹Æ—˜‰v•ÏX—¦', '—ˆŠú—\‘zŒoí—˜‰v•ÏX—¦', '—ˆŠú—\‘z“–Šúƒ—˜‰v•ÏX—¦']
+            quarterly_df.index = df.index
+            quarterly_df = pd.concat([df, quarterly_df], axis=1)
+            return quarterly_df
+
+        def get_pred_actual_rate(stock_fin):
+            df = stock_fin.copy()
+            uri_list = []
+            eigyo_list = []
+            keijyo_list = []
+            jyun_list = []
+            yoso_list = stock_fin['—ˆŠú—\‘zŒˆZŠú'].values.tolist()
+
+            had_list = []  # “ñ”Ô–Ú‚ÍŒvZ‚µ‚È‚¢B
+            for index, row in df.iterrows():
+                uri, eigyo, keijyo,jyun = 0, 0, 0, 0
+                df_back = stock_fin.copy()
+                if row['ŒˆZŠú'] in yoso_list and row['ŒˆZŠú'] not in had_list:
+                    search_df = df_back.drop_duplicates(subset=['—ˆŠú—\‘zŒˆZŠú', ],keep="last")
+                    search_df = search_df[search_df['—ˆŠú—\‘zŒˆZŠú'] == row['ŒˆZŠú']]
+
+                    values = search_df['—ˆŠú—\‘z”„ã‚'].values
+                    uri =  values[0] if values.size > 0 else 0
+
+                    values = search_df['—ˆŠú—\‘z‰c‹Æ—˜‰v'].values
+                    eigyo =  values[0] if values.size > 0 else 0
+
+                    values = search_df['—ˆŠú—\‘zŒoí—˜‰v'].values
+                    keijyo =  values[0] if values.size > 0 else 0
+
+                    values = search_df['—ˆŠú—\‘z“–Šúƒ—˜‰v'].values
+                    jyun =  values[0] if values.size > 0 else 0
+
+                    had_list.append(row['ŒˆZŠú'])
+
+                uri_list.append(uri)
+                eigyo_list.append(eigyo)
+                keijyo_list.append(keijyo)
+                jyun_list.append(jyun)
+
+
+            quarterly_df = pd.DataFrame([uri_list, eigyo_list, keijyo_list, jyun_list])
+            quarterly_df = quarterly_df.T
+            quarterly_df.columns = ['‘O—\‘z”„ã‚', '‘O—\‘z‰c‹Æ—˜‰v', '‘O—\‘zŒoí—˜‰v', '‘O—\‘z“–Šúƒ—˜‰v']
+            quarterly_df.index = df.index
+            quarterly_df = pd.concat([df, quarterly_df], axis=1)
+
+
+            return quarterly_df
+
+        def get_ratio(pred, actual):
+            res = 0
+            if pred is not np.nan and actual is not np.nan:
+                if pred != 0:
+                    res = (actual - pred) / np.abs(pred)
+
+            return res
+
+        df = df_org.copy()
+        df.rename(columns=fin_columns_trans, inplace = True)
+    #     print (df.columns)
+
+        res_df = pd.DataFrame()
+
+        # Feature V4
+        df[['—ˆŠú—\‘z”„ã‚', '—ˆŠú—\‘z‰c‹Æ—˜‰v', '—ˆŠú—\‘zŒoí—˜‰v', '—ˆŠú—\‘z“–Šúƒ—˜‰v',
+             '”„ã‚', '‰c‹Æ—˜‰v', 'Œoí—˜‰v', '“–Šúƒ—˜‰v']] = df[[
+            '—ˆŠú—\‘z”„ã‚', '—ˆŠú—\‘z‰c‹Æ—˜‰v', '—ˆŠú—\‘zŒoí—˜‰v', '—ˆŠú—\‘z“–Šúƒ—˜‰v',
+            '”„ã‚', '‰c‹Æ—˜‰v', 'Œoí—˜‰v', '“–Šúƒ—˜‰v']].fillna(0)
+
+        for code in codes:
+
+            stock_fin_tmp = df[df['Local Code'] == code].copy()
+            stock_fin_tmp_org = df[df['Local Code'] == code].copy()
+
+            org_len = stock_fin_tmp_org.shape[0]
+
+            #Feature V4
+            stock_fin_tmp = get_yoso_changerate(stock_fin_tmp)
+            stock_fin_tmp = get_pred_actual_rate(stock_fin_tmp)
+
+            stock_fin_tmp['—ˆŠú—\‘z”„ã‚•ÏX—¦']     = stock_fin_tmp['—ˆŠú—\‘z”„ã‚•ÏX—¦'].astype(float)
+            stock_fin_tmp['—ˆŠú—\‘z‰c‹Æ—˜‰v•ÏX—¦']   = stock_fin_tmp['—ˆŠú—\‘z‰c‹Æ—˜‰v•ÏX—¦'].astype(float)
+            stock_fin_tmp['—ˆŠú—\‘zŒoí—˜‰v•ÏX—¦']   = stock_fin_tmp['—ˆŠú—\‘zŒoí—˜‰v•ÏX—¦'].astype(float)
+            stock_fin_tmp['—ˆŠú—\‘z“–Šúƒ—˜‰v•ÏX—¦'] = stock_fin_tmp['—ˆŠú—\‘z“–Šúƒ—˜‰v•ÏX—¦'].astype(float)
+
+            stock_fin_tmp['‘O—\‘z”„ã‚']     = stock_fin_tmp['‘O—\‘z”„ã‚'].astype(float)
+            stock_fin_tmp['‘O—\‘z‰c‹Æ—˜‰v']   = stock_fin_tmp['‘O—\‘z‰c‹Æ—˜‰v'].astype(float)
+            stock_fin_tmp['‘O—\‘zŒoí—˜‰v']   = stock_fin_tmp['‘O—\‘zŒoí—˜‰v'].astype(float)
+            stock_fin_tmp['‘O—\‘z“–Šúƒ—˜‰v'] = stock_fin_tmp['‘O—\‘z“–Šúƒ—˜‰v'].astype(float)
+
+            stock_fin_tmp["“–Šúƒ—˜‰v—\ÀÑ”ä"] = stock_fin_tmp.apply(lambda row: get_ratio(row['‘O—\‘z“–Šúƒ—˜‰v'], row['“–Šúƒ—˜‰v']), axis=1).astype(float)
+            stock_fin_tmp["Œoí—˜‰v—\ÀÑ”ä"]   = stock_fin_tmp.apply(lambda row: get_ratio(row['‘O—\‘zŒoí—˜‰v'], row['Œoí—˜‰v']), axis=1).astype(float)
+            stock_fin_tmp["‰c‹Æ—˜‰v—\ÀÑ”ä"]   = stock_fin_tmp.apply(lambda row: get_ratio(row['‘O—\‘z‰c‹Æ—˜‰v'], row['‰c‹Æ—˜‰v']), axis=1).astype(float)
+            stock_fin_tmp["”„ã‚—\ÀÑ”ä"]     = stock_fin_tmp.apply(lambda row: get_ratio(row['‘O—\‘z”„ã‚'], row['”„ã‚']), axis=1).astype(float)
+
+
+            # ÀÑà–±î•ñ‚ğˆ—
+            stock_fin_tmp_nan = stock_fin_tmp[stock_fin_tmp['XV“ú'].isna()]
+            stock_fin_tmp = stock_fin_tmp[~stock_fin_tmp['XV“ú'].isna()]
+            stock_fin_tmp['ŒˆZí•Ê'] = stock_fin_tmp['ŒˆZí•Ê'].replace(['Annual'], 'Q4')
+
+            stock_fin_tmp_back = stock_fin_tmp.copy()
+            stock_fin_tmp.drop_duplicates(subset=["ŒˆZŠú",'ŒˆZí•Ê',"XV“ú"],keep="first", inplace=True)
+
+            quarterly_df = get_fin_quarterly_df(stock_fin_tmp)
+            stock_fin_tmp_n = pd.concat([stock_fin_tmp,quarterly_df ], axis = 1)
+
+            # Feature V2
+            stock_fin_tmp_n["¡Šú‘‘YL‚Ñ"] = stock_fin_tmp_n['‘‘Y'].diff() / stock_fin_tmp_n['‘‘Y'].abs().shift()
+            stock_fin_tmp_n["¡Šúƒ‘YL‚Ñ"] = stock_fin_tmp_n['ƒ‘Y'].diff() / stock_fin_tmp_n['ƒ‘Y'].abs().shift()
+            stock_fin_tmp_n["¡Šú‰c‹Æ—˜‰v—¦"] = stock_fin_tmp_n['¡Šú‰c‹Æ—˜‰v'] / stock_fin_tmp_n['¡Šú”„ã‚']
+            stock_fin_tmp_n["¡Šúƒ—˜‰v—¦"] = stock_fin_tmp_n['¡Šú“–Šúƒ—˜‰v'] / stock_fin_tmp_n['‘‘Y']
+
+            stock_fin_tmp_n['¡Šú‘‘YL‚Ñ'] = stock_fin_tmp_n['¡Šú‘‘YL‚Ñ'].astype(float)
+            stock_fin_tmp_n['¡Šúƒ‘YL‚Ñ'] = stock_fin_tmp_n['¡Šúƒ‘YL‚Ñ'].astype(float)
+            stock_fin_tmp_n["¡Šú‰c‹Æ—˜‰v—¦"] = stock_fin_tmp_n['¡Šú‰c‹Æ—˜‰v'].astype(float)
+            stock_fin_tmp_n["¡Šúƒ—˜‰v—¦"] = stock_fin_tmp_n['¡Šúƒ—˜‰v—¦'].astype(float)
+
+            stock_fin_tmp_back_n = pd.merge(stock_fin_tmp_back, stock_fin_tmp_n[[
+                '¡Šú”„ã‚', '¡Šú‰c‹Æ—˜‰v', '¡ŠúŒoí—˜‰v', '¡Šú“–Šúƒ—˜‰v',
+            '¡Šú”„ã‚L‚Ñ','¡Šú‰c‹Æ—˜‰vL‚Ñ', '¡ŠúŒoí—˜‰vL‚Ñ',  '¡Šú“–Šúƒ—˜‰vL‚Ñ',
+            '¡Šú‘‘YL‚Ñ','¡Šúƒ‘YL‚Ñ',"¡Šú‰c‹Æ—˜‰v—¦", "¡Šúƒ—˜‰v—¦",
+             "ŒˆZŠú",'ŒˆZí•Ê',"XV“ú"]], on=["ŒˆZŠú",'ŒˆZí•Ê',  "XV“ú"], how = 'outer')
+
+            # Feature V2 over
+            stock_fin_tmp_back_n.index = stock_fin_tmp_back.index
+
+            tmp_df = pd.concat([stock_fin_tmp_nan, stock_fin_tmp_back_n], sort=True)
+            tmp_df.sort_index(inplace = True)
+
+            # Nan ‚Ì“à—e‚ğˆ—
+
+            stock_fin_tmp_nan = tmp_df[tmp_df['XV“ú'].isna()]
+            stock_fin_tmp = tmp_df[~tmp_df['XV“ú'].isna()]
+            tmp_df = pd.DataFrame()
+            for i in range(len(stock_fin_tmp_nan)):
+                find = 0
+                base_time = stock_fin_tmp_nan.index.values[i]
+
+                for index, row in stock_fin_tmp.iterrows():
+                    if find_near_date(index,base_time):
+                        find = 1
+                        stock_fin_tmp_nan.loc[base_time, renew_columns] = row[renew_columns].values
+                        break
+                if find == 0:
+                    print ('fatal error ', code)
+
+            tmp_df = pd.concat([stock_fin_tmp_nan, stock_fin_tmp])
+            tmp_df.sort_index(inplace=True)
+
+            res_len = tmp_df.shape[0]
+            if res_len != org_len :
+                print ('not same len ', code)
+
+            res_df = pd.concat([res_df, tmp_df])
+
+        return res_df
+
+
+    @classmethod
+    def clean_feature_price(cls, df_org, code, start_dt="2016-01-01", n = 90):
+        # stock_priceƒf[ƒ^‚ğ“Ç‚İ‚Ş
+    #     price = dfs["stock_price"]
+        price = df_org.copy()
+        # “Á’è‚Ì–Á•¿ƒR[ƒh‚Ìƒf[ƒ^‚Éi‚é
+        price_data = price[price["Local Code"] == code]
+        # I’l‚Ì‚İ‚Éi‚é
+        feats = price_data[["EndOfDayQuote ExchangeOfficialClose"]]
+
+        # “Á’¥—Ê‚Ì¶¬‘ÎÛŠúŠÔ‚ğw’è
+        feats = feats.loc[pd.Timestamp(start_dt) - pd.offsets.BDay(n) :].copy()
+
+    #     ema_list = talib.EMA(feats['EndOfDayQuote ExchangeOfficialClose'].values, timeperiod=20).tolist()
+    #     feats = pd.concat([feats, pd.DataFrame(ema_list, index=feats.index, columns=['ema_20'])], axis=1)
+        feats['ema_20'] = feats['EndOfDayQuote ExchangeOfficialClose'].ewm(span=20,min_periods=1).mean()
+        feats['ema_10'] = feats['EndOfDayQuote ExchangeOfficialClose'].ewm(span=10,min_periods=1).mean()
+        feats['ema_5'] = feats['EndOfDayQuote ExchangeOfficialClose'].ewm(span=5,min_periods=1).mean()
+
+    #     rsi_list = talib.RSI(feats['EndOfDayQuote ExchangeOfficialClose'].values, timeperiod=14).tolist()
+    #     feats = pd.concat([feats, pd.DataFrame(rsi_list, index=feats.index, columns=['rsi'])], axis=1)
+        feats['rsi'] = cls.get_rsi(feats['EndOfDayQuote ExchangeOfficialClose'], 14)
+
+    #     macd, macdsignal, macdhist = talib.MACD(feats['EndOfDayQuote ExchangeOfficialClose'].values,
+    #                                             fastperiod=12, slowperiod=26, signalperiod=9)
+    #     feats = pd.concat([feats, pd.DataFrame(macd, index=feats.index, columns=['macd'])], axis=1)
+    #     feats = pd.concat([feats, pd.DataFrame(macdsignal, index=feats.index, columns=['macdsignal'])], axis=1)
+    #     feats = pd.concat([feats, pd.DataFrame(macdhist, index=feats.index, columns=['macdhist'])], axis=1)
+        macd, macdsignal, macdhist = cls.get_macd(feats['EndOfDayQuote ExchangeOfficialClose'])
+        macd_df = pd.concat([macd, macdsignal, macdhist],  axis=1 )
+        macd_df.columns =['macd', 'macdsignal', 'macdhist']
+        feats = pd.concat([feats, macd_df], axis=1)
+
+        feats['diff_close_ema_20'] = feats['EndOfDayQuote ExchangeOfficialClose'] - feats['ema_20']
+        feats['diff_close_ema_10'] = feats['EndOfDayQuote ExchangeOfficialClose'] - feats['ema_10']
+        feats['diff_close_ema_5'] = feats['EndOfDayQuote ExchangeOfficialClose'] - feats['ema_5']
+
+        feats['ema_20'] = feats['ema_20'].replace([np.nan], 0)
+        feats['ema_10'] = feats['ema_10'].replace([np.nan], 0)
+        feats['ema_5'] = feats['ema_5'].replace([np.nan], 0)
+
+        feats['macd'] = feats['macd'].replace([np.nan], 0)
+        feats['macdsignal'] = feats['macdsignal'].replace([np.nan], 0)
+        feats['macdhist'] = feats['macdhist'].replace([np.nan], 0)
+        feats["macdhist_diff1"] = feats["macdhist"].diff()
+
+        feats['rsi'] = feats['rsi'].replace([np.nan], -1)
+
+        feats['diff_close_ema_20'] = feats['diff_close_ema_20'].replace([np.nan], 0)
+        feats['diff_close_ema_10'] = feats['diff_close_ema_10'].replace([np.nan], 0)
+        feats['diff_close_ema_5'] = feats['diff_close_ema_5'].replace([np.nan], 0)
+        # I’l‚Ì20‰c‹Æ“úƒŠƒ^[ƒ“
+        feats["return_1month"] = feats[
+            "EndOfDayQuote ExchangeOfficialClose"
+        ].pct_change(20)
+        # I’l‚Ì40‰c‹Æ“úƒŠƒ^[ƒ“
+        feats["return_2month"] = feats[
+            "EndOfDayQuote ExchangeOfficialClose"
+        ].pct_change(40)
+        # I’l‚Ì60‰c‹Æ“úƒŠƒ^[ƒ“
+        feats["return_3month"] = feats[
+            "EndOfDayQuote ExchangeOfficialClose"
+        ].pct_change(60)
+        # I’l‚Ì20‰c‹Æ“úƒ{ƒ‰ƒeƒBƒŠƒeƒB
+        feats["volatility_1month"] = (
+            np.log(feats["EndOfDayQuote ExchangeOfficialClose"])
+            .diff()
+            .rolling(20)
+            .std()
+        )
+        # I’l‚Ì40‰c‹Æ“úƒ{ƒ‰ƒeƒBƒŠƒeƒB
+        feats["volatility_2month"] = (
+            np.log(feats["EndOfDayQuote ExchangeOfficialClose"])
+            .diff()
+            .rolling(40)
+            .std()
+        )
+        # I’l‚Ì60‰c‹Æ“úƒ{ƒ‰ƒeƒBƒŠƒeƒB
+        feats["volatility_3month"] = (
+            np.log(feats["EndOfDayQuote ExchangeOfficialClose"])
+            .diff()
+            .rolling(60)
+            .std()
+        )
+        # I’l‚Æ20‰c‹Æ“ú‚Ì’PƒˆÚ“®•½‹Ïü‚Ì˜¨—£
+        feats["MA_gap_1month"] = feats["EndOfDayQuote ExchangeOfficialClose"] / (
+            feats["EndOfDayQuote ExchangeOfficialClose"].rolling(20).mean()
+        )
+        # I’l‚Æ40‰c‹Æ“ú‚Ì’PƒˆÚ“®•½‹Ïü‚Ì˜¨—£
+        feats["MA_gap_2month"] = feats["EndOfDayQuote ExchangeOfficialClose"] / (
+            feats["EndOfDayQuote ExchangeOfficialClose"].rolling(40).mean()
+        )
+        # I’l‚Æ60‰c‹Æ“ú‚Ì’PƒˆÚ“®•½‹Ïü‚Ì˜¨—£
+        feats["MA_gap_3month"] = feats["EndOfDayQuote ExchangeOfficialClose"] / (
+            feats["EndOfDayQuote ExchangeOfficialClose"].rolling(60).mean()
+        )
+        # Œ‡‘¹’lˆ—
+        feats = feats.fillna(0)
+        # Œ³ƒf[ƒ^‚ÌƒJƒ‰ƒ€‚ğíœ
+    #     feats = feats.drop(["EndOfDayQuote ExchangeOfficialClose"], axis=1)
+
+        return feats
+
+    @classmethod
+    def predict(cls, inputs, labels=None, codes=None, start_dt=TEST_START):
+        """Predict method
+
+        Args:
+            inputs (dict[str]): paths to the dataset files
+            labels (list[str]): target label names
+            codes (list[int]): traget codes
+            start_dt (str): specify date range
+        Returns:
+            str: Inference for the given input.
+        """
+
+        # ƒf[ƒ^“Ç‚İ‚İ
+        if cls.dfs is None:
+            cls.get_dataset(inputs)
+            cls.get_codes(cls.dfs)
+
+        # —\‘ª‘ÎÛ‚Ì–Á•¿ƒR[ƒh‚Æ–Ú“I•Ï”‚ğİ’è
+        if codes is None:
+            codes = cls.codes
+        if labels is None:
+            labels = cls.TARGET_LABELS
+
+        # “Á’¥—Ê‚ğì¬
+        feats  = cls.get_features_for_predict(cls.dfs, codes, start_dt)
+
+        # Œ‹‰Ê‚ğˆÈ‰º‚ÌcsvŒ`®‚Åo—Í‚·‚é
+        # ‚P—ñ–Ú:datetime‚Æcode‚ğ‚Â‚È‚°‚½‚à‚Ì(Ex 2016-05-09-1301)
+        # ‚Q—ñ–Ú:label_high_20@I’l¨Å‚’l‚Ö‚Ì•Ï‰»—¦
+        # ‚R—ñ–Ú:label_low_20@I’l¨ÅˆÀ’l‚Ö‚Ì•Ï‰»—¦
+        # header‚Í‚È‚µAB—ñC—ñ‚Ífloat64
+
+        # “ú•t‚Æ–Á•¿ƒR[ƒh‚Éi‚è‚İ
+        df = feats.loc[:, ["Local Code"]].copy()
+        # code‚ğo—ÍŒ`®‚Ì‚P—ñ–Ú‚Æˆê’v‚³‚¹‚é
+        df.loc[:, "code"] = df.index.strftime("%Y-%m-%d-") + df.loc[:, "Local Code"].astype(
+            str
+        )
+
+        # o—Í‘ÎÛ—ñ‚ğ’è‹`
+        output_columns = ["code"]
+
+        # “Á’¥—ÊƒJƒ‰ƒ€‚ğw’è
+        # feature_columns = cls.get_feature_columns(feats)
+
+        # –Ú“I•Ï”–ˆ‚É—\‘ª
+        for label in labels:
+            # —\‘ªÀ{
+    #         df[label] = cls.models[label].predict(xgb.DMatrix(feats[feature_columns]))
+            feats = feats[cls.models_fname[label]]
+            # df[label] = cls.models[label].predict(xgb.DMatrix(feats))
+            df[label] = cls.models[label].predict(feats)
+            # o—Í‘ÎÛ—ñ‚É’Ç‰Á
+            output_columns.append(label)
+
+        out = io.StringIO()
+        df.to_csv(out, header=False, index=False, columns=output_columns)
+    #     df.to_csv('res.csv', header=False, index=False, columns=output_columns)
+
+        return out.getvalue()
+
+    @classmethod
+    def save_model(cls, model, label, model_path="../model"):
+        """
+        Args:
+            model (RandomForestRegressor): trained model
+            label (str): prediction target label
+            model_path (str): path to save model
+        Returns:
+            -
+        """
+        # tag::save_model_partial[]
+        # ƒ‚ƒfƒ‹•Û‘¶æƒfƒBƒŒƒNƒgƒŠ‚ğì¬
+    #     os.makedirs(model_path, exist_ok=True)
+        with open(os.path.join(model_path, f"model_{label}.pkl"), "wb") as f:
+            # ƒ‚ƒfƒ‹‚ğpickleŒ`®‚Å•Û‘¶
+            pickle.dump(model, f)
+        # end::save_model_partial[]
+
+    @classmethod
+    def get_features_and_label_release(cls, stock_labels_df, codes, feature, label):
+        """
+        Args:
+            codes  (array) : target codes
+            feature (pd.DataFrame): features
+            label (str) : label column name
+        Returns:
+            train_X (pd.DataFrame): training data
+            train_y (pd.DataFrame): label for train_X
+        """
+        # •ªŠ„ƒf[ƒ^—p‚Ì•Ï”‚ğ’è‹`
+        trains_X, vals_X, tests_X = [], [], []
+        trains_y, vals_y, tests_y = [], [], []
+
+        # –Á•¿ƒR[ƒh–ˆ‚É“Á’¥—Ê‚ğì¬
+        for code in tqdm(codes):
+            # “Á’¥—Êæ“¾
+            feats = feature[feature["Local Code"] == code]
+    #         print (feats.index)
+
+            # stock_labelƒf[ƒ^‚ğ“Ç‚İ‚İ
+            stock_labels = stock_labels_df
+            # “Á’è‚Ì–Á•¿ƒR[ƒh‚Ìƒf[ƒ^‚Éi‚é
+            stock_labels = stock_labels[stock_labels["Local Code"] == code]
+
+            # “Á’è‚Ì–Ú“I•Ï”‚Éi‚é
+            labels = stock_labels[label].copy()
+            # nan‚ğíœ
+            labels.dropna(inplace=True)
+
+            if feats.shape[0] > 0 and labels.shape[0] > 0:
+                # “Á’¥—Ê‚Æ–Ú“I•Ï”‚ÌƒCƒ“ƒfƒbƒNƒX‚ğ‡‚í‚¹‚é
+                labels = labels.loc[labels.index.isin(feats.index)]
+                feats = feats.loc[feats.index.isin(labels.index)]
+                labels.index = feats.index
+
+                # ƒf[ƒ^‚ğ•ªŠ„
+                _train_X = feats
+    #             _val_X = feats[VAL_START : VAL_END]
+    #             _test_X = feats[TEST_START :]
+
+                _train_y = labels
+    #             _val_y = labels[VAL_START : VAL_END]
+    #             _test_y = labels[TEST_START :]
+
+                # ƒf[ƒ^‚ğ”z—ñ‚ÉŠi”[ (Œã‚Ù‚ÇŒ‹‡‚·‚é‚½‚ß)
+                trains_X.append(_train_X)
+    #             vals_X.append(_val_X)
+    #             tests_X.append(_test_X)
+
+                trains_y.append(_train_y)
+    #             vals_y.append(_val_y)
+    #             tests_y.append(_test_y)
+        # –Á•¿–ˆ‚Éì¬‚µ‚½à–¾•Ï”ƒf[ƒ^‚ğŒ‹‡‚µ‚Ü‚·B
+        train_X = pd.concat(trains_X)
+    #     val_X = pd.concat(vals_X)
+    #     test_X = pd.concat(tests_X)
+        # –Á•¿–ˆ‚Éì¬‚µ‚½–Ú“I•Ï”ƒf[ƒ^‚ğŒ‹‡‚µ‚Ü‚·B
+        train_y = pd.concat(trains_y)
+    #     val_y = pd.concat(vals_y)
+    #     test_y = pd.concat(tests_y)
+
+        return train_X, train_y
+
+    @classmethod
+    def train_lgb_release_v2(cls, X_train, Y_train, ishigh = True):
+        def lgb_srcc(preds, dtrain):
+            # ³‰ğƒ‰ƒxƒ‹
+            correlation, _ = spearmanr(preds, dtrain.get_label())
+            res = np.square(correlation - 1)
+            # name, result, is_higher_better
+            return 'my_srcc', res, False
+
+        dtrain = lgb.Dataset(X_train, label=Y_train)
+    #     dvalid = lgb.Dataset(X_valid, label=Y_valid)
+
+        evaluation_results = {}
+
+        if ishigh :
+            lgb_params = {
+                'objective': 'regression',
+                'boosting' : 'gbdt',
+
+                'learning_rate': 0.0055236664051955976,
+                'lambda_l1': 0.1587286765153048,
+                'lambda_l2': 8.833730956821778,
+                'num_leaves': 189,
+                'feature_fraction': 0.5166696703449053,
+                'bagging_fraction': 0.5990863491585487,
+                'bagging_freq': 3,
+                'feature_fraction_bynode': 0.4008196760802559,
+                'min_child_samples': 68,
+                'extra_trees': False,
+
+                'device': 'gpu',
+                'gpu_platform_id':0,
+                'gpu_device_id':0,
+                'seed':2021,
+                'gpu_use_dp':True,
+
+            }
+            n_round = 1358
+        else:
+            lgb_params = {
+                'objective': 'regression',
+                'boosting' : 'gbdt',
+
+                'learning_rate': 0.007740353750838104,
+                'lambda_l1': 0.001278456428331565,
+                'lambda_l2': 7.135400428360081,
+                'num_leaves': 197,
+                'feature_fraction': 0.7547278991463711,
+                'bagging_fraction': 0.751573777368312,
+                'bagging_freq': 1,
+                'feature_fraction_bynode': 0.4404796208698425,
+                'min_child_samples': 27,
+                'extra_trees': True,
+
+                'device': 'gpu',
+                'gpu_platform_id':0,
+                'gpu_device_id':0,
+                'seed':2021,
+                'gpu_use_dp':True,
+            }
+            n_round = 2875
+
+        model = lgb.train(params=lgb_params,
+                          train_set=dtrain,
+    #                       valid_sets=[dvalid],
+    #                       valid_names=['Valid'],
+                          num_boost_round =n_round,
+    #                       early_stopping_rounds = 200,
+                          verbose_eval = -1,
+                          evals_result=evaluation_results,
+                          feval =lgb_srcc,
+        )
+
+
+        return model
+
+    @classmethod
+    def get_feature_columns( cls, feats):
+
+    #     not_use_list = ['Local Code', 'ŒˆZ”N“x','EndOfDayQuote ExchangeOfficialClose',]
+        not_use_list = ['Local Code', 'ŒˆZ”N“x','EndOfDayQuote ExchangeOfficialClose',
+                       '—ˆŠú—\‘zŒˆZ”N“x', 'IssuedShareEquityQuote_IssuedShare',
+                        '”z“–ŒˆZ”N“x',
+                       'ˆêŠ”l”¼Šú”z“–‹à','ˆêŠ””NŠÔ”z“–‹à—İŒv', '—\‘z”z“–ŒˆZ”N“x', '—\‘zˆêŠ”l”¼Šú”z“–‹à', '—\‘zˆêŠ””NŠÔ”z“–‹à—İŒv',
+                       ]
+
+        res_list = list(set(feats.columns.tolist()).difference(set(not_use_list)))
+
+        return res_list
+
+
+    @classmethod
+    def train( cls, inputs, start_dt="2016-01-01"):
+        # ƒf[ƒ^“Ç‚İ‚İ
+        if cls.dfs is None:
+            cls.get_dataset(inputs)
+            cls.get_codes(cls.dfs)
+
+        codes = cls.codes
+        # “Á’¥—Ê‚ğì¬
+        print ("goto get_features_for_predict")
+        feats  = cls.get_features_for_predict(cls.dfs, codes, start_dt)
+
+        f_list = cls.get_feature_columns(feats)
+        stock_labels_df = cls.dfs['stock_labels']
+        feature = feats
+
+        train_x_high, train_y_high = cls.get_features_and_label_release(stock_labels_df, codes, feature, 'label_high_20')
+        train_x_low,  train_y_low  = cls.get_features_and_label_release(stock_labels_df, codes, feature, 'label_low_20')
+
+        print ("goto train")
+        model_high = cls.train_lgb_release_v2(train_x_high[f_list], train_y_high, ishigh = True)
+        model_low  = cls.train_lgb_release_v2(train_x_low[f_list], train_y_low, ishigh = False)
+
+        cls.save_model(model_high, 'label_high_20')
+        cls.save_model(model_low, 'label_low_20')
+
+
+
